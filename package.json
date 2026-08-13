@@ -1,6 +1,6 @@
 {
   "name": "@voxyfy/anadolushield",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "OpenAI, Anthropic (Claude) ve Gemini gibi yapay zeka servislerine göndermeden önce TCKN, VKN, IBAN, telefon ve isim gibi kişisel verileri maskeleyen, KVKK uyum riskini azaltan Türkçe kişisel veri koruma kütüphanesi (Node.js/TypeScript)",
   "license": "MIT",
   "type": "module",

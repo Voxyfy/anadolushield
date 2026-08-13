@@ -1,4 +1,4 @@
-import { EntityMatch, EntityType } from './types.js';
+import { BuiltInEntityType, CustomDetectorDefinition, EntityMatch, EntityType } from './types.js';
 import { detectTckn } from './detectors/tckn.js';
 import { detectVkn } from './detectors/vkn.js';
 import { detectIban } from './detectors/iban.js';
@@ -6,10 +6,21 @@ import { detectPhone } from './detectors/phone.js';
 import { detectEmail } from './detectors/email.js';
 import { detectCreditCard } from './detectors/creditCard.js';
 import { detectPersonName } from './detectors/personName.js';
+import { detectAddress } from './detectors/address.js';
 
 export interface AnadoluShieldConfig {
-  /** Hangi varlık türleri tespit edilsin. Varsayılan: hepsi. */
-  types?: EntityType[];
+  /** Hangi hazır varlık türleri tespit edilsin. Varsayılan: hepsi. */
+  types?: BuiltInEntityType[];
+  /** Kendi kişisel veri türlerinizi (regex veya fonksiyon) eklemenizi sağlar. */
+  customDetectors?: CustomDetectorDefinition[];
+}
+
+/** Bir LLM yanıtı parça parça (streaming) geldiğinde placeholder'ları güvenle geri doldurmak için. */
+export interface StreamRestorer {
+  /** Yeni gelen parçayı işler, güvenle yayınlanabilecek (tamamlanmamış placeholder içermeyen) kısmı döner. */
+  push(chunk: string): string;
+  /** Akış bittiğinde, arabellekte kalan son parçayı işler. */
+  flush(): string;
 }
 
 export interface RedactResult {
@@ -17,11 +28,13 @@ export interface RedactResult {
   redactedText: string;
   /** Bulunan eşleşmeler — denetim/log amaçlı; bunu asla LLM'e veya dışarıya göndermeyin. */
   matches: EntityMatch[];
-  /** LLM'den dönen yanıttaki placeholder'ları orijinal değerlerle geri değiştirir. */
+  /** LLM'den dönen (tek parça hâlindeki) yanıttaki placeholder'ları orijinal değerlerle geri değiştirir. */
   restore(llmOutput: string): string;
+  /** LLM yanıtı parça parça (streaming) geliyorsa kullanılır — bkz. README "Streaming yanıtlarda kullanım". */
+  restoreStream(): StreamRestorer;
 }
 
-const ALL_DETECTORS: Record<EntityType, (text: string) => EntityMatch[]> = {
+const BUILT_IN_DETECTORS: Record<BuiltInEntityType, (text: string) => EntityMatch[]> = {
   TCKN: detectTckn,
   VKN: detectVkn,
   IBAN: detectIban,
@@ -29,15 +42,40 @@ const ALL_DETECTORS: Record<EntityType, (text: string) => EntityMatch[]> = {
   EPOSTA: detectEmail,
   KART: detectCreditCard,
   ISIM: detectPersonName,
+  ADRES: detectAddress,
 };
 
 /**
  * Çakışan eşleşmelerde (örn. bir IBAN'ın içindeki 10 haneli bir alt dizi
  * yanlışlıkla VKN kontrolünü de geçebilir) hangi türün kazanacağını
  * belirler. Kontrol basamaklı, daha güvenilir türler (IBAN/TCKN/KART) daha
- * gevşek eşleşen türlerden (VKN/TELEFON) önce gelir.
+ * gevşek eşleşen türlerden (VKN/TELEFON/ADRES) önce gelir. Özel tespit
+ * ediciler (`customDetectors`) listede yoksa en sona, en düşük önceliğe
+ * eklenir.
  */
-const PRIORITY: EntityType[] = ['IBAN', 'TCKN', 'KART', 'VKN', 'EPOSTA', 'TELEFON', 'ISIM'];
+const BUILT_IN_PRIORITY: BuiltInEntityType[] = ['IBAN', 'TCKN', 'KART', 'VKN', 'EPOSTA', 'TELEFON', 'ADRES', 'ISIM'];
+
+function toDetectorFn(definition: CustomDetectorDefinition): (text: string) => EntityMatch[] {
+  if (definition.detect) {
+    return definition.detect;
+  }
+
+  if (definition.pattern) {
+    const pattern = definition.pattern.global ? definition.pattern : new RegExp(definition.pattern, 'g');
+
+    return (text: string) => {
+      const matches: EntityMatch[] = [];
+      for (const m of text.matchAll(pattern)) {
+        if (m.index !== undefined) {
+          matches.push({ type: definition.type, value: m[0], start: m.index, end: m.index + m[0].length });
+        }
+      }
+      return matches;
+    };
+  }
+
+  throw new Error(`Özel tespit edici "${definition.type}" için ne \`pattern\` ne \`detect\` verildi.`);
+}
 
 /**
  * AnadoluShield
@@ -54,11 +92,17 @@ export class AnadoluShield {
   constructor(private readonly config: AnadoluShieldConfig = {}) {}
 
   redact(text: string): RedactResult {
-    const enabledTypes = this.config.types ?? (Object.keys(ALL_DETECTORS) as EntityType[]);
+    const enabledTypes = this.config.types ?? (Object.keys(BUILT_IN_DETECTORS) as BuiltInEntityType[]);
+    const customDefinitions = this.config.customDetectors ?? [];
 
-    const allMatches = enabledTypes
-      .flatMap((type) => ALL_DETECTORS[type](text))
-      .sort((a, b) => (a.start !== b.start ? a.start - b.start : PRIORITY.indexOf(a.type) - PRIORITY.indexOf(b.type)));
+    const priority: EntityType[] = [...BUILT_IN_PRIORITY, ...customDefinitions.map((d) => d.type)];
+
+    const builtInMatches = enabledTypes.flatMap((type) => BUILT_IN_DETECTORS[type](text));
+    const customMatches = customDefinitions.flatMap((definition) => toDetectorFn(definition)(text));
+
+    const allMatches = [...builtInMatches, ...customMatches].sort((a, b) =>
+      a.start !== b.start ? a.start - b.start : priority.indexOf(a.type) - priority.indexOf(b.type),
+    );
 
     const accepted: EntityMatch[] = [];
     let lastEnd = -1;
@@ -70,7 +114,7 @@ export class AnadoluShield {
       }
     }
 
-    const counters: Partial<Record<EntityType, number>> = {};
+    const counters: Record<string, number> = {};
     const placeholderMap = new Map<string, string>();
     let redactedText = '';
     let cursor = 0;
@@ -86,15 +130,43 @@ export class AnadoluShield {
 
     redactedText += text.slice(cursor);
 
+    const restore = (llmOutput: string): string => {
+      let result = llmOutput;
+      for (const [placeholder, original] of placeholderMap) {
+        result = result.split(placeholder).join(original);
+      }
+      return result;
+    };
+
     return {
       redactedText,
       matches: accepted,
-      restore: (llmOutput: string) => {
-        let result = llmOutput;
-        for (const [placeholder, original] of placeholderMap) {
-          result = result.split(placeholder).join(original);
-        }
-        return result;
+      restore,
+      restoreStream: (): StreamRestorer => {
+        let buffer = '';
+
+        return {
+          push(chunk: string): string {
+            buffer += chunk;
+
+            // Arabellekte tamamlanmamış bir placeholder ("[TCKN_" gibi, henüz
+            // kapanış "]" gelmemiş) varsa, o kısmı bir sonraki parçaya kadar
+            // bekletiyoruz — aksi halde placeholder ikiye bölünürse geri
+            // doldurma başarısız olur.
+            const lastOpen = buffer.lastIndexOf('[');
+            const safeEnd = lastOpen !== -1 && buffer.indexOf(']', lastOpen) === -1 ? lastOpen : buffer.length;
+
+            const toEmit = buffer.slice(0, safeEnd);
+            buffer = buffer.slice(safeEnd);
+
+            return restore(toEmit);
+          },
+          flush(): string {
+            const rest = buffer;
+            buffer = '';
+            return restore(rest);
+          },
+        };
       },
     };
   }

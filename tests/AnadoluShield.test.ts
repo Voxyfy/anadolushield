@@ -48,6 +48,6 @@ describe('AnadoluShield (redact + restore)', () => {
     const shield = createAnadoluShield();
     const result = shield.redact('TCKN 10000000146');
 
-    expect(Object.keys(result)).toEqual(['redactedText', 'matches', 'restore']);
+    expect(Object.keys(result)).toEqual(['redactedText', 'matches', 'restore', 'restoreStream']);
   });
 });
